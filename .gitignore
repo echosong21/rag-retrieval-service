@@ -1,0 +1,19 @@
+# 密钥
+.env
+*.env
+!example.env
+# 运行产物
+logs/
+*.log
+*.db
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+# 大数据（语料/索引，不进仓）
+corpus/
+data/
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
