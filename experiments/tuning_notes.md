@@ -131,6 +131,41 @@
 
 ---
 
-## 五、本地 CI 复现（节2 补记）
+## 五、本地 CI 复现
 
-> 待补：`pytest -q` 真实输出。
+### 5.1 `pytest -q` 真实输出（2026-10-14）
+
+```
+..                                                                       [100%]
+2 passed in 0.05s
+```
+
+### 5.2 测试内容（`tests/test_settings.py`）
+
+| 用例 | 断言什么 |
+|---|---|
+| `test_all_keys_present` | `.env` 齐全时六项配置非空 |
+| `test_missing_key_raises` | 缺 key 时 `assert_env()` 抛 `AssertionError` |
+
+### 5.3 踩过的坑（值得记住）
+
+**坑：`monkeypatch.delenv` + `importlib.reload` ≠ "缺 key"**
+
+首次实现用 `monkeypatch.delenv("API_KEY")` + `importlib.reload(settings)`，测试报
+`Failed: DID NOT RAISE AssertionError`。
+
+**根因**：`settings.py` 用 **`load_dotenv()` 从 `.env` 文件**读配置 ⇒ 删掉**进程环境变量**后，
+`reload` 会重新执行 `load_dotenv()`，`.env` 里的值**又被填回来** ⇒ `assert_env()` 自然不报错。
+
+**修法**：改为 `monkeypatch.setattr(settings, "API_KEY", None)` ——
+**直接改模块属性**（不依赖环境变量）；`assert_env()` 读的正是模块级全局名 ⇒ 生效、测试转绿。
+**⇒ 教训：测"配置校验"时要想清楚配置的**来源**（环境变量 vs 文件），两者不是一回事。**
+
+### 5.4 已知差异：CI 环境与本地不同（待办）
+
+GitHub Actions 里**没有 `.env` 文件**（被 `.gitignore` 排除）⇒ `load_dotenv()` 读不到任何键
+⇒ **`test_all_keys_present` 在 CI 里会失败**（本地却通过）。
+**待办（下次 CI 迭代）**：二选一 ——
+① 在 CI 的 `test` job 里**生成假 `.env`**（`echo "API_KEY=dummy" >> .env` …）；
+② **把该测试改为 `monkeypatch.setenv` 注入六键**（不依赖 `.env`，更"单元测试"）。
+**⇒ 教训：「本地能跑」≠「CI 能跑」，测试与环境的耦合要在写测试时就想到。**

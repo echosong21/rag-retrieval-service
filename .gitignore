@@ -10,6 +10,8 @@ logs/
 __pycache__/
 *.py[cod]
 .venv/
+.pytest_cache/
+.ruff_cache/
 # 大数据（语料/索引，不进仓）
 corpus/
 data/
