@@ -36,4 +36,46 @@ grid:
 
 # 已跑记录：每次**正式对比实验**追加一条；中间的重构/冒烟验证不记（避免基线混乱）。
 # 字段：date / grid / params / n_chunks / timing_s / hit_rate / commit
-runs: []
+runs:
+  # ── 建库脚本参数化后的首次重建（P0 验证）─────────────────────────────
+  - date: 2026-10-20
+    grid: chunking.baseline
+    params: {chunk_size: 600, chunk_overlap: 80, index_type: "", metric_type: COSINE}
+    collection: law_docs_p0
+    n_chunks: 22900
+    timing_s: {split: 0.5, embed: 442.2, write: 110.1, total: 552.8}
+    hit_rate: 1.0
+    embedding_model: qwen3.7-text-embedding-flash
+    commit: f80923c
+    note: >
+      分形态块数与既有集合逐项一致（docs 4376 / faq 7307 / tables 4475 / dialogues 6742），
+      说明参数化改造未改变切分行为。属冒烟验证，不作为对外基线。
+
+  # ── 检索策略对比：N+1 修复（并发替代串行）───────────────────────────
+  - date: 2026-10-20
+    grid: retrieval
+    params: {mode: multi, per_form: 3, concurrency: 4}
+    collection: law_docs
+    n_chunks: 22900
+    hit_rate: 1.0
+    metrics: {top1_expected_rate: 0.706, mrr: 0.8317, latency_mean_ms: 234.6}
+    commit: 5c96557
+    working_tree: true
+    note: >
+      单查询并发 48.2ms vs 串行 208.8ms（-76.9%），且结果集与串行逐项一致（语义不变）。
+      历史串行基线延迟 392ms 对应 e0c1a0a，环境不同不可直接比。
+
+  # ── 检索策略对比：混合检索（dense + BM25 + 两层 RRF）─────────────────
+  - date: 2026-10-20
+    grid: retrieval
+    params: {mode: hybrid, per_form: 3, fusion: two_layer_rrf, dense_sparse_weight: "1:1"}
+    collection: law_docs
+    n_chunks: 22900
+    hit_rate: 1.0
+    metrics: {top1_expected_rate: 0.706, mrr: 0.7737, latency_mean_ms: 631.1}
+    commit: 5c96557
+    working_tree: true
+    note: >
+      多召回 1 个来源（hit 16 → 17），但截断到同一预算（K=3/5/8/12）后排名**在任何预算下
+      都不如纯向量多路**，K=3/5 时命中率落后 17.6pt ⇒ 默认关闭，保留为可选项。
+      对照：单层 8 路 RRF 更差（top1 47.1%、MRR 0.6536）；给 dense 加权对结果无影响。
