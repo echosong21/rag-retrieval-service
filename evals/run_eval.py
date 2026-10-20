@@ -67,19 +67,19 @@ def judge(expected_sources, hits):
     return verdict, matched, n_hit, n_exp
 
 
-def run_one(item, mode,per_form):
+def run_one(item, mode, per_form, collection):
     t0 = time.perf_counter()
     qvec = emb.embed_query(item["question"])
     embed_ms = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
     if mode == "single":
-        raw = client.search(collection_name=COLLECTION, data=[qvec],
+        raw = client.search(collection_name=collection, data=[qvec],
                             limit=TOP_K, output_fields=["text", "source"])[0]
     else:
         raw = []
         for form in ["docs", "faq", "dialogues", "tables"]:
-            raw.extend(client.search(collection_name=COLLECTION, data=[qvec],
+            raw.extend(client.search(collection_name=collection, data=[qvec],
                                      limit=per_form,          # ← 不是 TOP_K
                                      output_fields=["text", "source"],
                                      filter=f'source like "{form}/%"')[0])
@@ -114,18 +114,22 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["single", "multi"], default="single")
     p.add_argument("--per-form", type=int, default=PER_FORM)
+    p.add_argument("--collection", default=COLLECTION,
+                   help="要评测的集合名（默认 law_docs）；换集合用于切分/索引对比实验")
     args = p.parse_args()
     golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
     mode = args.mode
     per_form = args.per_form
+    collection = args.collection
 
-    print(f"golden set: {len(golden)} questions | top_k={TOP_K} min_score={MIN_SCORE} mode={mode}")
+    print(f"golden set: {len(golden)} questions | collection={collection} "
+          f"| top_k={TOP_K} min_score={MIN_SCORE} mode={mode}")
     print("-" * 96)
 
 
     results = []
     for item in golden:
-        r = run_one(item, mode,per_form)
+        r = run_one(item, mode, per_form, collection)
         results.append(r)
         mark = {"hit": "OK  ", "partial": "PART", "miss": "MISS"}[r["verdict"]]
         print(
@@ -134,7 +138,7 @@ def main():
         )
 
     stamp = datetime.now().strftime("%Y-%m-%d")
-    out = RESULT_DIR / f"results_{stamp}_{mode}_pf{args.per_form}.jsonl"
+    out = RESULT_DIR / f"results_{stamp}_{collection}_{mode}_pf{per_form}.jsonl"
     with open(out, "w", encoding="utf-8") as f:
         for r in results:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -158,7 +162,7 @@ def main():
             "mode": mode,
             "per_form": per_form,
             "embed_model": os.getenv("EMBED_MODEL"),
-            "collection": COLLECTION,
+            "collection": collection,
         },
         "n_questions": total,
         "verdicts": dict(verdicts),
@@ -166,9 +170,6 @@ def main():
         "by_form_hit_rate": {k: round(v[0] / v[1], 4) for k, v in sorted(by_form.items())},
         "latency_ms": {"mean": round(sum(lat) / len(lat), 1), "max": round(max(lat), 1)},
     }
-    (RESULT_DIR / f"summary_{stamp}_{mode}_pf{args.per_form}.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
 
     print("-" * 96)
     print(f"总体命中率 : {hit_like}/{total} = {summary['overall_hit_rate']:.1%}")
@@ -180,7 +181,7 @@ def main():
     print(f"判定分布   : {dict(verdicts)}")
     print()
     print(f"结果落盘   : {out}")
-    summary_path = RESULT_DIR / f"summary_{stamp}_{mode}_pf{per_form}.json"
+    summary_path = RESULT_DIR / f"summary_{stamp}_{collection}_{mode}_pf{per_form}.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"汇总落盘   : {summary_path}")
 
