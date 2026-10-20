@@ -10,8 +10,29 @@ sys.stdout.reconfigure(encoding="utf-8")
 from langchain_openai import ChatOpenAI,OpenAIEmbeddings
 from pymilvus import MilvusClient
 from config import settings
+from src import retrieval as rt
 
 COLLECTION = "law_docs"
+
+# ── BM25 索引懒加载 ──────────────────────────────────────────────────
+# 只有混合检索模式才需要；懒加载避免其他模式白等约 2 秒的索引加载。
+BM25_CACHE_KEY = "935426c666faa59d"
+_bm25_bundle = None
+
+
+def _get_bm25_bundle():
+    global _bm25_bundle
+    if _bm25_bundle is None:
+        import pickle
+
+        from src import bm25 as bm
+        cache = bm.CACHE_DIR / f"vectors_{BM25_CACHE_KEY}.pkl"
+        items = pickle.loads(cache.read_bytes())["items"]
+        bm25, docs, _stats, form_index = bm.build_or_load(items, BM25_CACHE_KEY)
+        # 预热两处惰性初始化（jieba 词典 + 打分侧），否则第一个请求会慢约 1 秒
+        bm.warmup(bm25)
+        _bm25_bundle = (bm25, docs, form_index)
+    return _bm25_bundle
 
 emb = OpenAIEmbeddings(
     model=settings.EMBED_MODEL,
@@ -85,9 +106,15 @@ def rag_query(question: str, top_k: int = 3, min_score: float = 0.0) -> dict:
 
     return {"answer": answer, "contexts": contexts, "usage": usage, "stage_ms": stage_ms,
             "top_k": top_k, "min_score": min_score, "n_raw": len(raw)}
-FORMS = ["docs", "faq", "dialogues", "tables"]
-def rag_query_multi(question: str, per_form: int = 2, min_score: float = 0.0, top_k: int = 3) -> dict:
-    """按形态多路召回：每个形态各取 per_form 条，合并后统一过滤/生成"""
+FORMS = ["docs", "faq", "dialogues", "tables"]   # 检索逻辑已移入 src/retrieval.py，此处保留供参考
+def rag_query_multi(question: str, per_form: int = 2, min_score: float = 0.0,
+                    top_k: int = 3, hybrid: bool = False) -> dict:
+    """按形态多路召回：每个形态各取 per_form 条，合并后统一过滤/生成。
+
+    `hybrid=True` 时额外走 BM25 稀疏召回并做 RRF 融合。
+    ⚠️ 默认 **False**：实测混合检索的排名质量不如纯向量多路，且延迟约 2.7 倍
+    （详见 `DESIGN.md` 第 9 节）。
+    """
     stage_ms, contexts, usage, answer, raw = {}, [], None, None, []
     trace_id = observe.new_trace_id()
     status, error = "ok", None
@@ -97,24 +124,25 @@ def rag_query_multi(question: str, per_form: int = 2, min_score: float = 0.0, to
         stage_ms["embed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
         t0 = time.perf_counter()
-        merged = []
-        for form in FORMS:
-            hits = client.search(
-                collection_name=COLLECTION,
-                data=[qvec],
-                limit=per_form,
-                filter=f'source like "{form}/%"',
-                output_fields=["text", "source"],
-            )[0]
-            merged.extend(hits)
-            logger.info("trace=%s form=%s 命中=%d", trace_id, form, len(hits))
-        stage_ms["search_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-
-        raw = [{"score": round(h["distance"], 4),
-                "source": h["entity"]["source"],
-                "text": h["entity"]["text"]} for h in merged]
-        raw.sort(key=lambda c: c["score"], reverse=True)
-        contexts = [c for c in raw if c["score"] >= min_score]
+        if hybrid:
+            raw, stage = rt.retrieve_hybrid(client, qvec, question, COLLECTION,
+                                            per_form, _get_bm25_bundle())
+            stage_ms["search_ms"] = round(
+                stage["dense_ms"] + stage["sparse_ms"] + stage["fuse_ms"], 1)
+            # 三段分开记录，否则无法判断混合检索把时间花在哪
+            for key in ("dense_ms", "sparse_ms", "fuse_ms"):
+                stage_ms[key] = stage[key]
+            stage_ms["n_dense"], stage_ms["n_sparse"] = stage["n_dense"], stage["n_sparse"]
+            contexts = raw                     # 已按融合顺序排好，不再重排
+        else:
+            # 按形态并发召回，替代原来的 4 次串行请求：
+            # 语义完全不变（仍是每形态各 per_form 条），只是不再等待叠加。
+            merged, per_form_ms, wall_ms = rt.retrieve_dense_multi(
+                client, qvec, COLLECTION, per_form)
+            stage_ms["search_ms"] = wall_ms
+            stage_ms["search_per_form_ms"] = per_form_ms
+            raw = sorted(merged, key=lambda c: c["score"], reverse=True)
+            contexts = [c for c in raw if c["score"] >= min_score]
         t0 = time.perf_counter()
         if contexts:
             materials = "\n\n".join(
@@ -136,15 +164,18 @@ def rag_query_multi(question: str, per_form: int = 2, min_score: float = 0.0, to
             "trace_id": trace_id,
             "ts": datetime.now().isoformat(timespec="seconds"),
             "question": question,
-            "params": {"mode": "multi", "per_form": per_form, "top_k": top_k, "min_score": min_score},  # ← 参数进 trace
+            "params": {"mode": "hybrid" if hybrid else "multi",
+                       "per_form": per_form, "top_k": top_k, "min_score": min_score},  # ← 参数进 trace
             "stage_ms": stage_ms, "usage": usage, "cost_cny": cost,
             "retrieval": span, "status": status, "error": error,
         })
-        logger.info("trace=%s status=%s per_form=%s mode=multi min_score=%s n_raw=%s n_kept=%s stage_ms=%s cost=%.6f元",
-                    trace_id, status, top_k, min_score, len(raw), len(contexts), stage_ms, cost)
+        logger.info("trace=%s status=%s per_form=%s mode=%s min_score=%s n_raw=%s n_kept=%s stage_ms=%s cost=%.6f元",
+                    trace_id, status, per_form, "hybrid" if hybrid else "multi",
+                    min_score, len(raw), len(contexts), stage_ms, cost)
 
     return {"answer": answer, "contexts": contexts, "usage": usage, "stage_ms": stage_ms,
-            "per_form": per_form,"mode": "multi", "min_score": min_score, "n_raw": len(raw)}
+            "per_form": per_form, "mode": "hybrid" if hybrid else "multi",
+            "min_score": min_score, "n_raw": len(raw)}
 
 
 if __name__ == "__main__":
@@ -154,10 +185,14 @@ if __name__ == "__main__":
     parser.add_argument("--min-score", type=float, default=0.0)
     parser.add_argument("--mode", type=str, default="single", choices=["single", "multi"])
     parser.add_argument("--per-form", type=int, default=2)
+    parser.add_argument("--hybrid", action="store_true",
+                        help="启用混合检索（dense + BM25 + RRF）。"
+                             "默认关闭：实测排名质量不如纯向量多路，且延迟约 2.7 倍")
 
     args = parser.parse_args()
     if args.mode == "multi":
-        out = rag_query_multi(args.question, per_form=args.per_form, min_score=args.min_score)
+        out = rag_query_multi(args.question, per_form=args.per_form,
+                              min_score=args.min_score, hybrid=args.hybrid)
         print(f"【问题】{args.question}")
         print(f"【参数】per_form={out['per_form']}  min_score={out['min_score']}"
               f"  |  候选 {out['n_raw']} → 保留 {len(out['contexts'])}")
