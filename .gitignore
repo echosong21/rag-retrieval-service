@@ -15,6 +15,8 @@ __pycache__/
 # 大数据（语料/索引，不进仓）
 corpus/
 data/
+# 分词器缓存（jieba 默认写在当前工作目录，会污染工作区）
+jieba.cache
 # IDE / OS
 .idea/
 .vscode/
