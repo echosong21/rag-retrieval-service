@@ -79,3 +79,50 @@ runs:
       多召回 1 个来源（hit 16 → 17），但截断到同一预算（K=3/5/8/12）后排名**在任何预算下
       都不如纯向量多路**，K=3/5 时命中率落后 17.6pt ⇒ 默认关闭，保留为可选项。
       对照：单层 8 路 RRF 更差（top1 47.1%、MRR 0.6536）；给 dense 加权对结果无影响。
+
+  # ── 索引参数对比：4 档（复用向量缓存，同一批块与切分）────────────────
+  # ⚠️ 结论：① 检索质量四档**完全相同**；② 延迟差异 ≤ 同档自身多次运行的波动 ⇒ 测不出差异。
+  #    ⇒ 判据（可复用）：只有「跨档差异 > 同档多次运行的波动」时，性能差异才成立。
+  #    latency_p50_ms 记两次独立运行的值，正是为了体现这条判据。
+  - date: 2026-10-21
+    grid: index.default
+    params: {index_type: "", index_params: {}, metric_type: COSINE}
+    collection: law_docs_idx_default
+    n_chunks: 22900
+    timing_s: {split: 0.5, embed: 0.0, write: 314.1, total: 314.6}
+    hit_rate: 1.0
+    metrics: {top1_expected_rate: 0.706, mrr: 0.8382, latency_p50_ms: [18.5, 17.4]}
+    commit: 887aa03
+    note: >
+      write 314.1s 为服务端开机后的**首次**写入（冷启动），非索引属性；
+      其余三档为 262.7–265.2s。timing 含 insert + 建索引，未拆分（insert 主导约 255s）。
+
+  - date: 2026-10-21
+    grid: index.hnsw_m16
+    params: {index_type: HNSW, index_params: {M: 16, efConstruction: 200}}
+    collection: law_docs_idx_hnsw16
+    n_chunks: 22900
+    timing_s: {split: 0.5, embed: 0.0, write: 265.2, total: 265.8}
+    hit_rate: 1.0
+    metrics: {top1_expected_rate: 0.706, mrr: 0.8382, latency_p50_ms: [18.2, 18.5]}
+    commit: 887aa03
+
+  - date: 2026-10-21
+    grid: index.hnsw_m32
+    params: {index_type: HNSW, index_params: {M: 32, efConstruction: 400}}
+    collection: law_docs_idx_hnsw32
+    n_chunks: 22900
+    timing_s: {split: 0.4, embed: 0.0, write: 262.7, total: 263.1}
+    hit_rate: 1.0
+    metrics: {top1_expected_rate: 0.706, mrr: 0.8382, latency_p50_ms: [17.7, 17.5]}
+    commit: 887aa03
+
+  - date: 2026-10-21
+    grid: index.ivf_flat
+    params: {index_type: IVF_FLAT, index_params: {nlist: 128}}
+    collection: law_docs_idx_ivf
+    n_chunks: 22900
+    timing_s: {split: 0.5, embed: 0.0, write: 264.7, total: 265.1}
+    hit_rate: 1.0
+    metrics: {top1_expected_rate: 0.706, mrr: 0.8382, latency_p50_ms: [17.4, 17.5]}
+    commit: 887aa03

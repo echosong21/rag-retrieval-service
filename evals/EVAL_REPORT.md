@@ -271,7 +271,116 @@ Two traps hit along the way, both worth remembering:
 
 ---
 
-## 7. Reproduce
+## 7. Index parameters: no measurable difference (2026-10-21)
+
+### 7.1 What was compared
+
+Four indexes built over the **same vectors and the same chunking** (22,900 chunks,
+identical embedding model), plus the original collection as a reference:
+
+| Collection | Index | Commit |
+|---|---|---|
+| `law_docs` | (original, server default) | — |
+| `law_docs_idx_default` | server default | `887aa03` |
+| `law_docs_idx_hnsw16` | HNSW, `M=16`, `efConstruction=200` | `887aa03` |
+| `law_docs_idx_hnsw32` | HNSW, `M=32`, `efConstruction=400` | `887aa03` |
+| `law_docs_idx_ivf` | IVF_FLAT, `nlist=128` | `887aa03` |
+
+### 7.2 Retrieval quality: **identical**
+
+| Index | Hit rate | Top-1 is expected | MRR |
+|---|:--:|:--:|:--:|
+| default | 100% | 70.6% | 0.8382 |
+| HNSW M=16 | 100% | 70.6% | 0.8382 |
+| HNSW M=32 | 100% | 70.6% | 0.8382 |
+| IVF_FLAT | 100% | 70.6% | 0.8382 |
+
+All four configurations return the **same candidate sets** — the metrics are identical
+to the last digit. **There is no measurable quality difference between these indexes
+at this scale.**
+
+### 7.3 Retrieval latency: the difference does **not** survive repetition
+
+**Method** (this is the part that matters):
+
+- **Retrieval only** — query vectors were embedded once and reused; the embedding cost
+  (150–200 ms) is common to all variants and would have swamped the signal.
+- **85 measured searches per collection** (17 questions × 5 rounds), after a warm-up
+  pass, since the first searches carry one-off initialisation cost.
+- **The whole benchmark was run twice** — and that is what settled the question.
+
+**Run 1**
+
+| Collection | p50 | p90 | p95 | max |
+|---|:--:|:--:|:--:|:--:|
+| `law_docs` | **17.5** | 47.8 | 54.5 | 139.8 |
+| `idx_default` | **18.5** | 68.8 | 109.0 | 277.2 |
+| `idx_hnsw16` | 18.2 | 63.9 | 84.2 | 312.3 |
+| `idx_hnsw32` | 17.7 | 51.8 | 62.7 | 160.1 |
+| `idx_ivf` | **17.4** | 48.4 | 56.9 | 286.7 |
+
+**Run 2**
+
+| Collection | p50 | p90 | p95 | max |
+|---|:--:|:--:|:--:|:--:|
+| `law_docs` | **19.4** | 77.3 | 104.3 | 309.8 |
+| `idx_default` | **17.4** | 51.9 | 65.2 | 317.8 |
+| `idx_hnsw16` | 18.5 | 81.4 | 114.4 | 316.3 |
+| `idx_hnsw32` | 17.5 | 38.3 | 49.1 | 308.2 |
+| `idx_ivf` | 17.5 | 47.5 | 68.9 | 128.5 |
+
+**⇒ The ranking reversed between the two runs.** In run 1 the fastest was `idx_ivf`
+(17.4 ms) and the slowest `idx_default` (18.5 ms); in run 2 those two swapped
+(the fastest became `idx_default`, and `law_docs` became the slowest at 19.4 ms).
+
+- **Spread between indexes: 1.1–2.0 ms.**
+- **Spread of the *same* index across two runs: 1.1–1.9 ms.**
+
+⇒ The between-option spread sits **inside** the within-option noise. The tail is even
+less stable: `law_docs` p95 moved 54.5 → 104.3 ms (+91%) between runs, and
+`idx_default` moved 109.0 → 65.2 ms (−40%).
+
+### 7.4 Findings
+
+**Finding 10 — Index choice does not change retrieval results at this scale.**
+All four indexes produce identical hit rate, top-1 and MRR. This independently confirms
+the decision recorded in `DESIGN.md` §6 (keep the server default): its switch condition
+was *"when latency becomes the bottleneck or memory gets tight"*, and at 22,900 chunks
+swapping the index does not even move latency.
+
+**Finding 11 — A latency difference must beat run-to-run variance to count.**
+Run 1 alone showed a clean-looking ranking ("IVF_FLAT fastest, default slowest").
+A repeat reversed it. ⇒ **±1–2 ms is the resolution limit of this setup**, and every
+between-index difference measured here falls within it.
+
+### 7.5 The reusable rule (the most valuable output of this experiment)
+
+> **To claim a performance difference, compare the spread *between* options against the
+> spread *within* one option across repeated runs. Only if the former is larger is the
+> difference real.**
+>
+> Without the repeat, run 1 would have produced a confident — and wrong — conclusion.
+> Note also what made the repeat cheap: the query vectors were pre-computed, so a second
+> run cost no embedding calls.
+
+### 7.6 Build cost (secondary, and not comparable across runs)
+
+| Index | Write time |
+|---|:--:|
+| default | 314.1 s ← **first write after server start (cold)** |
+| HNSW M=16 | 265.2 s |
+| HNSW M=32 | 262.7 s |
+| IVF_FLAT | 264.7 s |
+
+⚠️ Two caveats, stated rather than papered over:
+1. The timing is **insert + index build combined**; insert dominates (~255 s), so the
+   index-build portion is small. It was not measured separately.
+2. The default index's 314 s is a **cold-start artifact**, not an index property —
+   it was the first write after the server came up.
+
+---
+
+## 8. Reproduce
 
 ```bash
 python evals/run_eval.py --mode single
