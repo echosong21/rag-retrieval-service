@@ -85,20 +85,20 @@ not *how good the best match is*.
 
 ## 5. Performance and cost (measured)
 
-Source: `logs/traces.jsonl` — **52 records** (2026-10-12 to 10-16), single machine,
-single embedding model. 51 succeeded, 1 failed (that failure is the missing-collection
+Source: `logs/traces.jsonl` — **53 records** (2026-10-12 to 10-20), single machine,
+single embedding model. 52 succeeded, 1 failed (that failure is the missing-collection
 issue documented in `TROUBLESHOOTING.md`).
 
 ### 5.1 Latency breakdown (successful requests only, ms)
 
 | Stage | **median** | mean | min | max |
 |---|:--:|:--:|:--:|:--:|
-| embedding | 366.6 | 579.2 | 284.9 | 3,697.3 |
-| **retrieval** | **30.6** | 387.3 | 13.8 | **16,674.3** |
-| **generation** | **2,897.1** | 3,439.0 | 0.0 | 10,470.9 |
+| embedding | 364.8 | 574.3 | 284.9 | 3,697.3 |
+| **retrieval** | **30.8** | 380.9 | 13.8 | **16,674.3** |
+| **generation** | **2,919.1** | 3,436.8 | 0.0 | 10,470.9 |
 
-**End-to-end composition (by median)**: embedding ≈ 367 ms + retrieval ≈ 31 ms +
-generation ≈ 2,897 ms **≈ 3.3 s**
+**End-to-end composition (by median)**: embedding ≈ 365 ms + retrieval ≈ 31 ms +
+generation ≈ 2,919 ms **≈ 3.3 s**
 
 > Means sit well above medians because a few outliers pull them up
 > (retrieval: mean 387 ms vs median 31 ms — a 12× gap)
@@ -108,24 +108,24 @@ generation ≈ 2,897 ms **≈ 3.3 s**
 
 | Metric | Value |
 |---|---|
-| Cost per query — mean / median | **0.00465 / 0.00448 CNY** |
+| Cost per query — mean / median | **0.00473 / 0.00454 CNY** |
 | Cost per query — min / max | 0.0 / 0.01234 CNY |
-| Total across 52 queries | **0.237 CNY** |
-| Input tokens — mean / max | 1,555.3 / 3,034 |
-| Output tokens — mean / max | 241.5 / 900 |
-| Total tokens — mean | 1,796.8 |
+| Total across 52 successful queries | **0.246 CNY** |
+| Input tokens — mean / max | 1,596.5 / 3,533 |
+| Output tokens — mean / max | 240.8 / 900 |
+| Total tokens — mean | 1,837.3 |
 
 ### 5.3 Three conclusions drawn from this data
 
 **① Generation is the only significant latency source; retrieval is not the bottleneck**
 
-Retrieval's median is **30.6 ms** — roughly **1%** of end-to-end latency.
+Retrieval's median is **30.8 ms** — roughly **1%** of end-to-end latency.
 ⇒ This **backs the decision not to tune the index** (see `DESIGN.md` §6): optimising a
 stage that accounts for 1% does nothing for user-visible latency.
 
 **② Retrieval is fast on average, but its tail is uncontrolled**
 
-Median 30.6 ms versus a maximum of **16,674 ms** (a spread of over 500×).
+Median 30.8 ms versus a maximum of **16,674 ms** (a spread of over 500×).
 ⇒ The goal of any retrieval-layer optimisation should therefore be
 **tail-latency stability, not a lower mean**. Judged by medians, removing all four
 serial retrievals would save only hundreds of milliseconds; the real gain lies in
@@ -133,8 +133,8 @@ serial retrievals would save only hundreds of milliseconds; the real gain lies i
 
 **③ Cost is small in magnitude, but the current figure is a lower bound**
 
-About **0.0045 CNY per query**, under 0.25 CNY across 52 queries — cost is not a
-constraint at this scale.
+About **0.0047 CNY per query**, just under 0.25 CNY across 52 successful queries — cost
+is not a constraint at this scale.
 
 ⚠️ **Scope caveat**: the trace records **generation-stage LLM cost** (token-based).
 **Embedding and (future) reranking calls are not included** ⇒ the figure above is a
@@ -187,19 +187,109 @@ One full rebuild of the 22,900-chunk index, recorded in one run:
 
 ---
 
-## 6. Reproduce
+## 6. Retrieval strategy comparison (2026-10-20)
+
+### 6.1 Configurations
+
+| Config | What it does | Commit |
+|---|---|---|
+| `multi` (serial) | 4 per-form queries executed **one after another** | `e0c1a0a` |
+| **`multi` (concurrent)** | same semantics, queries issued **in parallel** | `5c96557` |
+| **`hybrid`** | + a BM25 sparse route, fused with **two-layer RRF** (per-form fusion, then forms ordered by their best vector similarity) | `5c96557` |
+
+All three: 17 questions, `per_form=3`, `min_score=0.0`, same collection and embedding model.
+
+### 6.2 Results
+
+| Metric | `multi` serial (`e0c1a0a`) | `multi` concurrent | `hybrid` |
+|---|:--:|:--:|:--:|
+| Overall hit rate | 100% | **100%** | **100%** |
+| Verdicts | hit 16 / partial 1 | **identical** | hit 17 |
+| Candidates per query | 12 | 12 | 20–24 |
+| **Top-1 is expected** | — | **70.6%** | 70.6% |
+| **MRR** | — | **0.8284** | 0.7737 |
+| Latency (mean) | 392 ms | **234.6 ms** | 631.1 ms |
+
+> ⚠️ The 392 ms figure comes from a **different date**, so per §5.4 it is not directly
+> comparable. The reliable same-session measurement is the single-query one:
+> **concurrent 48.2 ms vs serial 208.8 ms (−76.9%)**, with an **identical result set**.
+
+### 6.3 Same-budget comparison
+
+`hybrid` returns a larger pool (20–24 candidates vs 12), and rank metrics are
+**sensitive to pool size**. Truncating both to the same budget `K` is the fair comparison:
+
+| K | `multi` hit / top1 / MRR | `hybrid` hit / top1 / MRR |
+|:--:|:--:|:--:|
+| **3** | **94.1%** / 70.6% / **0.8170** | 76.5% / 70.6% / 0.7353 |
+| **5** | **100.0%** / 70.6% / **0.8317** | 82.4% / 70.6% / 0.7471 |
+| 8 | 100.0% / 70.6% / **0.8317** | 100.0% / 70.6% / 0.7737 |
+| 12 | 100.0% / 70.6% / 0.8317 | 100.0% / 70.6% / 0.7737 |
+
+### 6.4 Findings
+
+**Finding 6 — Concurrency removes 77% of retrieval latency without changing results.**
+Single query: 208.8 ms → 48.2 ms. The per-form hits and the final result set are
+**identical** to the serial version, so the optimisation is behaviour-preserving.
+
+**Finding 7 — Hybrid retrieval is not a net win on this corpus.**
+It recalls one more source (verdicts `hit 16 / partial 1` → `hit 17`), but at **every
+budget** its ranking is worse, and at small budgets it is much worse
+(hit rate −17.6 pt at K=3/5). It needs **8+ candidates** to match what plain multi-route
+reaches with **5**. It is therefore **disabled by default**.
+
+**Finding 8 — How the two routes are fused matters more than whether they are fused.**
+A single-layer RRF over all 8 routes (4 forms × 2 retrievers) **damaged** ranking:
+top-1 70.6% → **47.1%**, MRR 0.8284 → **0.6536** (tables questions fell from rank 1 to
+ranks 7/8/7). Root cause: RRF gives **every route's rank-1 equal weight**, but the forms
+are not equally reliable (tables' best hit scores about 0.55 vs faq's about 0.72).
+Splitting into two layers — **per-form fusion** (which keeps the sparse recall
+contribution) and then **ordering forms by their best vector similarity** — restores
+top-1 to 70.6%.
+
+**Finding 9 — RRF weights did not change the outcome.**
+Weighting the dense route (1:1 / 2:1 / 3:1 / 5:1) produced **identical** results
+(17/17, 12/17, MRR 0.7737). ⚠️ The cause is **not** "the two routes rank alike":
+measured over 68 form-pairs, **0 were in the same order** and the candidate overlap was
+only **8%**. The real reason is that dense dominates the **top ranks**, so weighting only
+reorders the **tail** — the top-N composition and order stay the same.
+⇒ **Reusable rule: weighting helps only when the routes actually compete near the top.**
+
+### 6.5 Methodology note: pick metrics that can see the change
+
+The evaluation originally reported **hit rate only** — "is the expected source anywhere in
+the results". A fusion strategy **only changes the order, not the set**, so hit rate is
+blind to exactly the thing being tested. Adding **top-1-is-expected** and **MRR** made the
+effect visible — and that is what exposed Findings 8 and 9.
+
+Two traps hit along the way, both worth remembering:
+
+1. **Rank metrics are pool-size sensitive** ⇒ truncate to a common budget before comparing.
+2. **A difference computed across two different scenarios is not a unit cost.** Both
+   "which route is better" and "how many tokens per chunk" were once mis-attributed by
+   reasoning from deltas instead of from controlled measurements.
+
+---
+
+## 7. Reproduce
 
 ```bash
 python evals/run_eval.py --mode single
 python evals/run_eval.py --mode multi --per-form 2
 python evals/run_eval.py --mode multi --per-form 3
 python evals/run_eval.py --mode multi --per-form 5
+python evals/run_eval.py --mode hybrid --per-form 3     # dense + BM25 + two-layer RRF
 ```
 
-Each run writes `results/results_<date>_<mode>[_pf<N>].jsonl` (per question) and
-`results/summary_<date>_<mode>[_pf<N>].json` (aggregate). Parameters are recorded
-inside the summary, so numbers from different configurations are never confused.
+Each run writes `results/results_<date>_<collection>_<mode>_pf<N>.jsonl` (per question)
+and `results/summary_<date>_<collection>_<mode>_pf<N>.json` (aggregate). Parameters are
+recorded inside the summary, so numbers from different configurations are never confused.
 
 **Comparability rule:** the embedding model, collection and `min_score` must stay
 identical across runs. Changing the embedding model invalidates all comparisons
 (the query-side and index-side models must match).
+
+> ⚠️ **Pool-size rule (learned 2026-10-20):** when two configurations return **different
+> numbers of candidates**, do not compare their MRR / top-1 directly — a larger pool both
+> raises the hit rate and depresses the rank metrics. Truncate to a common budget `K`
+> first (see §6.3).
