@@ -27,6 +27,8 @@ from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings
 from pymilvus import MilvusClient
 
+from src import retrieval as rt     # 与 src/pipeline.py 共用同一套检索实现
+
 load_dotenv(ROOT / ".env")
 
 # ── frozen parameters ────────────────────────────────────────────────
@@ -67,30 +69,61 @@ def judge(expected_sources, hits):
     return verdict, matched, n_hit, n_exp
 
 
+# BM25 索引懒加载（只有 hybrid 模式需要，避免其他模式白等 2 秒）
+BM25_CACHE_KEY = "935426c666faa59d"
+_bm25_bundle = None
+
+
+def _get_bm25_bundle():
+    global _bm25_bundle
+    if _bm25_bundle is None:
+        import pickle
+
+        from src import bm25 as bm
+        cache = bm.CACHE_DIR / f"vectors_{BM25_CACHE_KEY}.pkl"
+        items = pickle.loads(cache.read_bytes())["items"]
+        bm25, docs, _stats, form_index = bm.build_or_load(items, BM25_CACHE_KEY)
+        print(f"[hybrid] BM25 预热 {bm.warmup(bm25)} ms（含 jieba 词典加载）")
+        _bm25_bundle = (bm25, docs, form_index)
+    return _bm25_bundle
+
+
 def run_one(item, mode, per_form, collection):
     t0 = time.perf_counter()
     qvec = emb.embed_query(item["question"])
     embed_ms = (time.perf_counter() - t0) * 1000
 
-    t0 = time.perf_counter()
-    if mode == "single":
-        raw = client.search(collection_name=collection, data=[qvec],
-                            limit=TOP_K, output_fields=["text", "source"])[0]
+    if mode == "hybrid":
+        raw, stage = rt.retrieve_hybrid(client, qvec, item["question"], collection,
+                                        per_form, _get_bm25_bundle())
+        search_ms = stage["dense_ms"] + stage["sparse_ms"] + stage["fuse_ms"]
+        ordered = raw                       # 已按 RRF 排好，不能再按分数重排
+    elif mode == "multi":
+        raw, _per_form_ms, search_ms = rt.retrieve_dense_multi(client, qvec, collection, per_form)
+        ordered = sorted(raw, key=lambda x: x["score"], reverse=True)
+    else:  # single
+        raw, search_ms = rt.retrieve_dense_single(client, qvec, collection, TOP_K)
+        ordered = sorted(raw, key=lambda x: x["score"], reverse=True)
+
+    # 相似度过滤：混合模式的 score 是 RRF 分数（尺度不同），故用 vec_score
+    if mode == "hybrid":
+        kept = [h for h in ordered if (h.get("vec_score") or 0.0) >= MIN_SCORE]
     else:
-        raw = []
-        for form in ["docs", "faq", "dialogues", "tables"]:
-            raw.extend(client.search(collection_name=collection, data=[qvec],
-                                     limit=per_form,          # ← 不是 TOP_K
-                                     output_fields=["text", "source"],
-                                     filter=f'source like "{form}/%"')[0])
-
-    search_ms = (time.perf_counter() - t0) * 1000
-
-    hits = [{"score": round(h["distance"], 4), "source": h["entity"]["source"]} for h in raw]
-    hits.sort(key=lambda x: x["score"], reverse=True)          # ← 补：全局排序
-    kept = [h for h in hits if h["score"] >= MIN_SCORE]
+        kept = [h for h in ordered if h["score"] >= MIN_SCORE]
 
     verdict, matched, n_hit, n_exp = judge(item["expected_source"], kept)
+
+    # ★ 名次类指标：命中率只看"在不在结果里"，看不到排序质量；
+    #   而融合策略（如 RRF）恰恰只改排序不改集合 ⇒ 必须单独记录名次。
+    srcs = [h["source"] for h in kept]
+    top1_source = srcs[0] if srcs else None
+    top1_expected = any(e in (top1_source or "") for e in item["expected_source"])
+    best_rank = next(
+        (i for i, s in enumerate(srcs, 1)
+         if any(e in s for e in item["expected_source"])),
+        None,
+    )
+
     return {
         "id": item["id"],
         "form": item["form"],
@@ -103,7 +136,10 @@ def run_one(item, mode, per_form, collection):
         "n_hit": n_hit,
         "n_expected": n_exp,
         "top1": kept[0]["score"] if kept else None,
-        "hit_sources": [h["source"] for h in kept],
+        "top1_source": top1_source,
+        "top1_expected": top1_expected,
+        "best_rank": best_rank,
+        "hit_sources": srcs,
         "embed_ms": round(embed_ms, 1),
         "search_ms": round(search_ms, 1),
         "total_ms": round(embed_ms + search_ms, 1),
@@ -112,7 +148,7 @@ def run_one(item, mode, per_form, collection):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["single", "multi"], default="single")
+    p.add_argument("--mode", choices=["single", "multi", "hybrid"], default="single")
     p.add_argument("--per-form", type=int, default=PER_FORM)
     p.add_argument("--collection", default=COLLECTION,
                    help="要评测的集合名（默认 law_docs）；换集合用于切分/索引对比实验")
@@ -132,9 +168,10 @@ def main():
         r = run_one(item, mode, per_form, collection)
         results.append(r)
         mark = {"hit": "OK  ", "partial": "PART", "miss": "MISS"}[r["verdict"]]
+        flag = "T1" if r["top1_expected"] else (f"r{r['best_rank']}" if r["best_rank"] else "--")
         print(
-            f"{r['id']:>3} {mark} {r['form']:<9} top1={r['top1']} "
-            f"({r['n_hit']}/{r['n_expected']}) {r['total_ms']:>7.1f}ms  {r['question'][:26]}"
+            f"{r['id']:>3} {mark} {r['form']:<9} {flag:>3} ({r['n_hit']}/{r['n_expected']}) "
+            f"{r['total_ms']:>7.1f}ms  {r['question'][:26]}"
         )
 
     stamp = datetime.now().strftime("%Y-%m-%d")
@@ -154,6 +191,12 @@ def main():
     lat = [r["total_ms"] for r in results]
     verdicts = Counter(r["verdict"] for r in results)
 
+    # ★ 名次类指标：命中率对"排序变化"不敏感（只要还在结果集里就算命中），
+    #   而融合策略恰恰只改排序 ⇒ 必须单独看名次，否则看不出融合的真实效果。
+    top1_ok = sum(1 for r in results if r["top1_expected"])
+    ranks = [r["best_rank"] for r in results if r["best_rank"]]
+    mrr = round(sum(1.0 / k for k in ranks) / len(ranks), 4) if ranks else 0.0
+
     summary = {
         "date": stamp,
         "params": {
@@ -169,6 +212,8 @@ def main():
         "overall_hit_rate": round(hit_like / total, 4),
         "by_form_hit_rate": {k: round(v[0] / v[1], 4) for k, v in sorted(by_form.items())},
         "latency_ms": {"mean": round(sum(lat) / len(lat), 1), "max": round(max(lat), 1)},
+        "top1_expected_rate": round(top1_ok / total, 4),
+        "mrr": mrr,
     }
 
     print("-" * 96)
@@ -178,6 +223,7 @@ def main():
         n_ok, n_all = by_form[form]
         print(f"  {form:<10} {n_ok}/{n_all} = {rate:.1%}")
     print(f"延迟       : 均值 {summary['latency_ms']['mean']}ms / 最大 {summary['latency_ms']['max']}ms")
+    print(f"★期待来源居首: {top1_ok}/{total} = {summary['top1_expected_rate']:.1%}    MRR = {mrr}")
     print(f"判定分布   : {dict(verdicts)}")
     print()
     print(f"结果落盘   : {out}")
