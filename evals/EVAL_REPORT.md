@@ -380,7 +380,101 @@ between-index difference measured here falls within it.
 
 ---
 
-## 8. Reproduce
+## 8. Chunk size: quality flat, cost trade-off (2026-10-22)
+
+### 8.1 What was compared
+
+Three chunk configurations over **the same source documents** (25 docs / 20 faq /
+1 dialogue / 3 tables), so all three index identical content and differ **only** in
+how it is cut:
+
+| Config | chunk_size | overlap | Chunks |
+|---|:--:|:--:|:--:|
+| small | 300 | 60 | 20,796 |
+| **baseline** | **600** | **80** | 8,755 |
+| large | 800 | 100 | 5,913 |
+
+> ⚠️ **A first attempt was discarded.** It limited each variant by *chunk count*
+> (`--subset-per-form 800`). Coarser chunking then packed the same 800 chunks with
+> **more source files**, so the variants saw **different corpora** — and the small
+> config appeared 41 points worse purely because two files never made it into the index.
+> Limiting by **file count** makes the comparison valid.
+
+### 8.2 Retrieval quality: identical
+
+| Config | Hit rate | Top-1 is expected | MRR | Verdicts |
+|---|:--:|:--:|:--:|---|
+| 300/60 | 70.6% | 58.8% | 0.8958 | miss 5 / hit 10 / partial 2 |
+| 600/80 | 70.6% | 58.8% | 0.8958 | miss 5 / hit 10 / partial 2 |
+| 800/100 | 70.6% | 58.8% | 0.8958 | miss 5 / hit 10 / partial 2 |
+
+**Identical to the last digit**, down to *which* five questions miss. ⇒ Within the
+300–800 character range, **chunk size does not affect recall on this corpus.**
+
+> The absolute 70.6% is lower than this report's usual 100% because the subset omits
+> most of the corpus, so some expected sources are simply absent. All three configs miss
+> the **same** questions, so the comparison remains fair.
+
+### 8.3 Costs: they move in opposite directions
+
+| Config | Build (one-off) | Search p50 (per call) | Material tokens (per call) |
+|---|:--:|:--:|:--:|
+| **300/60** | **728 s (2.1×)** | **23.3 ms (+17%)** | **1,651 (−48%)** |
+| 600/80 | 344 s | 19.9 ms | 3,200 |
+| **800/100** | **272 s (0.79×)** | **19.4 ms** | 4,052 (+27%) |
+
+**⇒ Finer chunking is *worse* on both build time and search latency** — a 2.4× vector
+count, and search cost tracks the number of vectors, not their text length. The only
+gain is in the **material handed to the generator**.
+
+### 8.4 The model that makes the decision: one-off vs per-call
+
+Chunk size trades a **one-off capital cost** against a **per-call operating cost**:
+
+```
+total(n) = build_cost + n × (search_cost + generation_cost)
+```
+
+⇒ **"Which chunk size is better" has no absolute answer — it depends on call volume.**
+Because quality is flat (§8.2), the decision can be made **purely on cost.**
+
+| Config | Build | Material per call | Wins when |
+|---|:--:|:--:|---|
+| 800/100 | lowest | highest | **few calls** (batch jobs, offline analysis) |
+| 300/60 | highest | **lowest** | **sustained traffic** (a service answering users) |
+
+**Worked break-even** (using the measured values):
+- extra build cost of 300/60 ≈ +0.53 M tokens
+- saving per call = 3,200 − 1,651 = **1,549 tokens**
+- ⇒ **break-even ≈ 340 calls** (~3 days at 100 q/day; ~34 days at 10 q/day)
+
+### 8.5 Findings
+
+**Finding 12 — Chunk size does not change recall here.** Identical hit rate, top-1 and
+MRR when the variants index the same documents.
+
+**Finding 13 — Finer chunking raises build *and* search cost.** It doubles the vector
+count; search latency and memory follow that, not the text length. The saving appears
+only in prompt material, and accrues per call.
+
+**Finding 14 — The choice is a volume question, not a quality question.** Low volume ⇒
+coarse; high volume ⇒ fine. The naive intuition ("smaller chunks are lighter") is wrong
+for the retrieval half of the cost.
+
+### 8.6 Limitations
+
+1. **Retrieval only** — generation quality was **not** measured. At 300/60 the average
+   chunk is ~138 tokens (≈18 characters of this corpus's fragments), which may hurt
+   answer completeness even though recall is unchanged. **This is the main open question.**
+2. **Subset, 17 questions** — low resolution; a 1–2 question effect could hide here.
+3. **Material tokens measured on a single question** (a real API call, not an estimate),
+   so the per-call figure is indicative rather than an average over the set.
+4. Absolute numbers will differ on the full 22,900-chunk corpus; the *relationships*
+   between configs are what this experiment establishes.
+
+---
+
+## 9. Reproduce
 
 ```bash
 python evals/run_eval.py --mode single
